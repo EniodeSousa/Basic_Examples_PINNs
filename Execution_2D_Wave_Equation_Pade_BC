@@ -1,0 +1,27 @@
+# Enable gradient tracking on inputs
+def generate_points(num_domain=2000, num_bc=200, num_ic=200):
+    t_dom = torch.rand(num_domain, 1, requires_grad = True)
+    x_dom= torch.rand(num_domain, 1, requires_grad = True)
+
+    # Boundary x=1 (or chosen, boundary)
+    t_bc = torch.rand(num_bc, 1, requires_grad=True)
+    x_bc = torch.ones(num_bc, 1, requires_grad=True)
+
+    # Initial Condition t=0
+    t_ic = torch.zeros(num_ic, 1, requires_grad=True)
+    x_ic = torch.rand(num_ic, 1, requires_grad=True)
+    u_ic = torch.sin(torch.pi*x_ic) # Example initial displacement
+
+    return (t_dom, x_dom), (t_bc, x_bc), (t_ic, x_ic, u_ic)
+
+# Initialize 
+model = PINN()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+n_order = 3 # Choose any integer n>=1
+
+# Optimization Step
+domain, bc, ic = generate_points()
+optimizer.zero_grad()
+loss = compute_loss(model, *domain, *bc, *ic, n=n_order)
+loss.backward()
+optimizer.step()
