@@ -1,0 +1,57 @@
+import torch
+import torch.nn as nn
+
+class PINN(nn.Module):
+    def __init__(self, hidden_dim=64, num_layers=4):
+        super().__init__()
+        layers = [nn.Linear(2,hidden_dim), nn.Tanh()]
+        for _ in range(num_layers - 1):
+            layers.extend([nn.Linear(hidden_dim,hidden_dim),nn.Tanh()])
+        layers.append(nn.Linear(hidden_dim,1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, t, x):
+        return self.net(torch.cat([t,x],dim=1))
+  def apply_operator_n_times(model,t,x,n:int):
+  #Recursively applies the operator (d/dt-d/dx)^n to the output u.
+      u=model(t,x)
+      curr=u
+      for _ in range(n):
+          grads = torch.autograd.grad(
+              outputs=curr,
+              inputs = [t,x],
+              grad_outputs = torch.ones_like(curr),
+              create_graph = True,
+              retain_graph = True,
+          )
+          dt, dx = grads[0], grads[1]
+          curr = dt-dx
+      return curr
+  def compute_pde_residual(model, t, x, c=1.0):
+      #Calculates wave equation residual u_tt - c^2 * u_xx
+      u=model(t,x)
+
+      #First derivatives
+      dt = torch.autograd.grad(u,t, torch.ones_like(u), create_graph=True)[0]
+      dx = torch.autograd.grad(u,x, torch.ones_like(u), create_graph=True)[0]
+
+      #Second derivatives
+      dtt = torch.autograd.grad(dt, t, torch.ones_like(dt), create_graph=True)[0]
+      dxx = torch.autograd.grad(dx, x, torch.ones_like(dx), create_graph=True)[0]
+
+      return dtt-(c**2)*dxx
+  def compute_loss(model, t_domain, x_domain, t_bc, t_ic, x_bc, x_ic, u_ic, n: int, weights=(1.0,1.0,1.0)):
+      # PDE Domain Loss
+      res_pde = compute_pde_residual(model, t_domain, x_domain)
+      loss_pde = torch.mean(res_pde**2)
+
+      # Custom High-Order Boundary Loss: (d/dt - d/dx)^n u =0
+      res_bc = apply_operator_n_times(model, t_bc, x_bc, n)
+      loss_bc = torch.mean(res_bc**2)
+
+      # Initial Condition Loss: u(0,x) = u_0(x)
+      u_pred_ic = model(t_ic, x_ic)
+      loss_ic = torch.mean((u_pred_ic - u_ic)**2)
+
+      w1,w2,w3 = weights
+      return w1*loss_pde + w2*loss_bc + w3*loss_ic
