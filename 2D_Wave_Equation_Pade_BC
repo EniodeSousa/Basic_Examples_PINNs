@@ -1,57 +1,160 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
 
+# Set seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Configuration Parameters
+N_ORDER = 1        # Derivative order n for boundary condition (\partial_t - \partial_x)^n u = 0
+C_WAVE_SPEED = 1.0 # Wave propagation speed c
+EPOCHS = 10000
+LR = 1e-3
+
+# -----------------------------------------------------------------------------
+# 1. PINN Architecture
+# -----------------------------------------------------------------------------
 class PINN(nn.Module):
     def __init__(self, hidden_dim=64, num_layers=4):
         super().__init__()
-        layers = [nn.Linear(2,hidden_dim), nn.Tanh()]
-        for _ in range(num_layers - 1):
-            layers.extend([nn.Linear(hidden_dim,hidden_dim),nn.Tanh()])
-        layers.append(nn.Linear(hidden_dim,1))
+        layers = [nn.Linear(3, hidden_dim), nn.Tanh()]
+        for _ in range(num_layers - 2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.Tanh()])
+        layers.append(nn.Linear(hidden_dim, 1))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, t, x):
-        return self.net(torch.cat([t,x],dim=1))
-  def apply_operator_n_times(model,t,x,n:int):
-  #Recursively applies the operator (d/dt-d/dx)^n to the output u.
-      u=model(t,x)
-      curr=u
-      for _ in range(n):
-          grads = torch.autograd.grad(
-              outputs=curr,
-              inputs = [t,x],
-              grad_outputs = torch.ones_like(curr),
-              create_graph = True,
-              retain_graph = True,
-          )
-          dt, dx = grads[0], grads[1]
-          curr = dt-dx
-      return curr
-  def compute_pde_residual(model, t, x, c=1.0):
-      #Calculates wave equation residual u_tt - c^2 * u_xx
-      u=model(t,x)
+    def forward(self, t, x, y):
+        g = torch.cat([t, x, y], dim=1)
+        return self.net(g), g
 
-      #First derivatives
-      dt = torch.autograd.grad(u,t, torch.ones_like(u), create_graph=True)[0]
-      dx = torch.autograd.grad(u,x, torch.ones_like(u), create_graph=True)[0]
+# -----------------------------------------------------------------------------
+# 2. Physics & Boundary Residuals
+# -----------------------------------------------------------------------------
+def pde_residual(model, t, x, y, c=C_WAVE_SPEED):
+    u, g = model(t, x, y)
+    grads = torch.autograd.grad(u, g, torch.ones_like(u), create_graph=True)[0]
+    u_t, u_x, u_y = grads[:, 0:1], grads[:, 1:2], grads[:, 2:3]
 
-      #Second derivatives
-      dtt = torch.autograd.grad(dt, t, torch.ones_like(dt), create_graph=True)[0]
-      dxx = torch.autograd.grad(dx, x, torch.ones_like(dx), create_graph=True)[0]
+    u_tt = torch.autograd.grad(u_t, g, torch.ones_like(u_t), create_graph=True)[0][:, 0:1]
+    u_xx = torch.autograd.grad(u_x, g, torch.ones_like(u_x), create_graph=True)[0][:, 1:2]
+    u_yy = torch.autograd.grad(u_y, g, torch.ones_like(u_y), create_graph=True)[0][:, 2:3]
 
-      return dtt-(c**2)*dxx
-  def compute_loss(model, t_domain, x_domain, t_bc, t_ic, x_bc, x_ic, u_ic, n: int, weights=(1.0,1.0,1.0)):
-      # PDE Domain Loss
-      res_pde = compute_pde_residual(model, t_domain, x_domain)
-      loss_pde = torch.mean(res_pde**2)
+    return u_tt - (c**2) * (u_xx + u_yy)
 
-      # Custom High-Order Boundary Loss: (d/dt - d/dx)^n u =0
-      res_bc = apply_operator_n_times(model, t_bc, x_bc, n)
-      loss_bc = torch.mean(res_bc**2)
+def nth_order_boundary_operator(model, t, x, y, n, spatial_dim=1):
+    """
+    Computes (\partial_t - \partial_x)^n u recursively via autograd.
+    spatial_dim=1 corresponds to x-derivative, spatial_dim=2 to y-derivative.
+    """
+    v, g = model(t, x, y)
+    for _ in range(n):
+        grads = torch.autograd.grad(v, g, torch.ones_like(v), create_graph=True)[0]
+        v = grads[:, 0:1] - grads[:, spatial_dim:spatial_dim+1]
+    return v
 
-      # Initial Condition Loss: u(0,x) = u_0(x)
-      u_pred_ic = model(t_ic, x_ic)
-      loss_ic = torch.mean((u_pred_ic - u_ic)**2)
+def initial_condition_loss(model, N=500):
+    # Gaussian pulse initial condition at t=0: u(0,x,y) = exp(-25*((x-0.5)^2 + (y-0.5)^2))
+    x_ic = torch.rand(N, 1, requires_grad=True)
+    y_ic = torch.rand(N, 1, requires_grad=True)
+    t_ic = torch.zeros(N, 1, requires_grad=True)
 
-      w1,w2,w3 = weights
-      return w1*loss_pde + w2*loss_bc + w3*loss_ic
+    u0_target = torch.exp(-25.0 * ((x_ic - 0.5)**2 + (y_ic - 0.5)**2))
+    u_pred, g = model(t_ic, x_ic, y_ic)
+    
+    # Velocity u_t(0,x,y) = 0
+    grads = torch.autograd.grad(u_pred, g, torch.ones_like(u_pred), create_graph=True)[0]
+    u_t_pred = grads[:, 0:1]
+
+    loss_u = torch.mean((u_pred - u0_target)**2)
+    loss_ut = torch.mean(u_t_pred**2)
+    return loss_u + loss_ut
+
+# -----------------------------------------------------------------------------
+# 3. Model Training
+# -----------------------------------------------------------------------------
+model = PINN()
+optimizer = optim.Adam(model.parameters(), lr=LR)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+for epoch in range(1, EPOCHS + 1):
+    optimizer.zero_grad()
+
+    # Domain Interior Residuals
+    N_dom = 1000
+    t_d = torch.rand(N_dom, 1, requires_grad=True)
+    x_d = torch.rand(N_dom, 1, requires_grad=True)
+    y_d = torch.rand(N_dom, 1, requires_grad=True)
+    loss_pde = torch.mean(pde_residual(model, t_d, x_d, y_d)**2)
+
+    # Boundary Residuals (x = 0, x = 1, y = 0, y = 1)
+    N_b = 250
+    t_b = torch.rand(N_b, 1, requires_grad=True)
+    rand_coord = torch.rand(N_b, 1, requires_grad=True)
+    zero_coord = torch.zeros(N_b, 1, requires_grad=True)
+    one_coord  = torch.ones(N_b, 1, requires_grad=True)
+
+    # (\partial_t - \partial_x)^n u = 0 on x=0 and x=1
+    bc1 = nth_order_boundary_operator(model, t_b, zero_coord, rand_coord, n=N_ORDER, spatial_dim=1)
+    bc2 = nth_order_boundary_operator(model, t_b, one_coord,  rand_coord, n=N_ORDER, spatial_dim=1)
+    
+    # Boundary condition on y=0 and y=1
+    bc3 = nth_order_boundary_operator(model, t_b, rand_coord, zero_coord, n=N_ORDER, spatial_dim=1)
+    bc4 = nth_order_boundary_operator(model, t_b, rand_coord, one_coord,  n=N_ORDER, spatial_dim=1)
+
+    loss_bc = torch.mean(bc1**2) + torch.mean(bc2**2) + torch.mean(bc3**2) + torch.mean(bc4**2)
+
+    # Initial Condition Loss
+    loss_ic = initial_condition_loss(model)
+
+    # Total Weighted Loss
+    loss = loss_pde + 10.0 * loss_bc + 20.0 * loss_ic
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+
+    if epoch % 1000 == 0 or epoch == 1:
+        print(f"Epoch {epoch:5d}/{EPOCHS} | Loss Total: {loss.item():.6f} | PDE: {loss_pde.item():.6f} | BC: {loss_bc.item():.6f} | IC: {loss_ic.item():.6f}")
+
+# -----------------------------------------------------------------------------
+# 4. Animated 3D Wave Surface Plot
+# -----------------------------------------------------------------------------
+grid_res = 50
+x_grid = np.linspace(0, 1, grid_res)
+y_grid = np.linspace(0, 1, grid_res)
+X, Y = np.meshgrid(x_grid, y_grid)
+x_flat = torch.tensor(X.flatten(), dtype=torch.float32).unsqueeze(1)
+y_flat = torch.tensor(Y.flatten(), dtype=torch.float32).unsqueeze(1)
+
+num_frames = 60
+t_frames = np.linspace(0, 1, num_frames)
+
+fig = plt.figure(figsize=(9, 7))
+ax = fig.add_subplot(111, projection='3d')
+
+def update_surface(frame_idx):
+    ax.clear()
+    t_val = t_frames[frame_idx]
+    t_flat = torch.full_like(x_flat, t_val)
+    
+    with torch.no_grad():
+        u_pred, _ = model(t_flat, x_flat, y_flat)
+        Z = u_pred.numpy().reshape(grid_res, grid_res)
+
+    surf = ax.plot_surface(X, Y, Z, cmap='viridis', edgecolor='none', vmin=-0.5, vmax=1.0)
+    ax.set_zlim(-0.8, 1.2)
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('u(t, x, y)')
+    ax.set_title(f'PINN Wave Evolution t = {t_val:.2f} (n={N_ORDER})')
+    return surf,
+
+anim = FuncAnimation(fig, update_surface, frames=num_frames, interval=50, blit=False)
+plt.show()
+
+# To save as GIF or MP4:
+# anim.save('pinn_wave_evolution.gif', writer='pillow', fps=20)
