@@ -1,0 +1,126 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
+# Hyperparameters
+n = 2  # Order of Higdon boundary condition
+c = 1.0  # Wave speed
+epochs = 10000
+lr = 1e-3
+
+# Get optimal angles
+theta_opts = optimize_angles(n=n, max_deg=75.0)
+cos_thetas = torch.tensor(np.cos(theta_opts), dtype=torch.float32)
+
+class HigdonPINN(nn.Module):
+    def __init__(self, n_auxiliary: int):
+        super().__init__()
+        # Outputs: [u (w_0), w_1, ..., w_{n-1}]
+        self.net = nn.Sequential(
+            nn.Linear(3, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+            nn.Linear(64, n_auxiliary)
+        )
+
+    def forward(self, txy):
+        return self.net(txy)
+
+model = HigdonPINN(n_auxiliary=n)
+optimizer = optim.Adam(model.parameters(), lr=lr)
+
+def compute_grads(y, x):
+    return torch.autograd.grad(
+        y, x, grad_outputs=torch.ones_like(y), create_graph=True
+    )[0]
+
+# --- Loss Functions ---
+def pde_loss(num_points=2000):
+    txy = torch.rand(num_points, 3, requires_grad=True)
+    out = model(txy)
+    u = out[:, 0:1]
+    
+    grads = compute_grads(u, txy)
+    u_t, u_x, u_y = grads[:, 0:1], grads[:, 1:2], grads[:, 2:3]
+    
+    u_tt = compute_grads(u_t, txy)[:, 0:1]
+    u_xx = compute_grads(u_x, txy)[:, 1:2]
+    u_yy = compute_grads(u_y, txy)[:, 2:3]
+    
+    residual = u_tt - (c**2) * (u_xx + u_yy)
+    return torch.mean(residual**2)
+
+def ic_loss(num_points=500):
+    xy = torch.rand(num_points, 2)
+    t0 = torch.zeros(num_points, 1)
+    txy = torch.cat([t0, xy], dim=1).requires_grad_(True)
+    
+    out = model(txy)
+    u = out[:, 0:1]
+    
+    # Gaussian wave packet initial state
+    x, y = xy[:, 0:1], xy[:, 1:2]
+    u_target = torch.exp(-50.0 * ((x - 0.5)**2 + (y - 0.5)**2))
+    
+    grads = compute_grads(u, txy)
+    u_t = grads[:, 0:1]
+    
+    return torch.mean((u - u_target)**2) + torch.mean(u_t**2)
+
+def bc_loss(num_points=300):
+    loss = torch.tensor(0.0)
+    # Define 4 faces of domain [0,1]^2
+    faces = [
+        ('x0', 1, 0.0, -1.0), # (name, dim_idx, fixed_val, normal_sign)
+        ('x1', 1, 1.0,  1.0),
+        ('y0', 2, 0.0, -1.0),
+        ('y1', 2, 1.0,  1.0)
+    ]
+    
+    for _, dim, val, n_sign in faces:
+        txy_raw = torch.rand(num_points, 3)
+        txy_raw[:, dim] = val
+        txy = txy_raw.clone().detach().requires_grad_(True)
+        
+        # Auxiliary outputs [w_0, w_1, ..., w_{n-1}]
+        w = model(txy)
+        
+        for j in range(n):
+            cos_th = cos_thetas[j]
+            w_prev = w[:, j:j+1]
+            
+            grads = compute_grads(w_prev, txy)
+            dw_dt = grads[:, 0:1]
+            dw_dn = n_sign * grads[:, dim:dim+1]
+            
+            # Recursive operator: w_j = cos(theta_j)*d_t(w_{j-1}) + c * d_nu(w_{j-1})
+            operator_target = cos_th * dw_dt + c * dw_dn
+            
+            if j < n - 1:
+                w_next = w[:, j+1:j+2]
+                loss = loss + torch.mean((w_next - operator_target)**2)
+            else:
+                # Top recursive step imposes w_n = 0
+                loss = loss + torch.mean((0.0 - operator_target)**2)
+                
+    return loss / len(faces)
+
+# --- Training Loop ---
+for epoch in range(1, epochs + 1):
+    optimizer.zero_grad()
+    l_pde = pde_loss()
+    l_ic = ic_loss()
+    l_bc = bc_loss()
+    
+    total_loss = l_pde + 10.0 * l_ic + 5.0 * l_bc
+    total_loss.backward()
+    optimizer.step()
+    
+    if epoch % 1000 == 0:
+        print(f"Epoch {epoch:5d} | Loss: {total_loss.item():.6f} "
+              f"| PDE: {l_pde.item():.6f} | IC: {l_ic.item():.6f} | BC: {l_bc.item():.6f}")
