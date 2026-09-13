@@ -1,0 +1,431 @@
+"""
+Higdon absorbing boundary conditions for the 2D wave equation, solved with a PINN.
+
+    u_tt = c^2 (u_xx + u_yy)            on (0,1)^2 x (0,T)
+    prod_{j=1..n} (cos(theta_j) d_t + c d_nu) u = 0     on the boundary
+
+with u(0) a Gaussian bump at rest.  The theta_j are the angles of incidence at
+which the boundary absorbs exactly; they are chosen by a minimax criterion.
+
+Everything is in this one file - no imports between files.  Run it as
+
+    python wave_abc_pinn.py
+
+or paste it into a single notebook cell.  ORDERS at the bottom lists which n to
+train; each one is trained, diagnosed against a finite-difference reference, and
+animated, and a comparison plot is written at the end.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib
+matplotlib.use('Agg')            # drop this line in a notebook if you want inline plots
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy.optimize import minimize
+
+
+# ============================================================
+#  configuration
+# ============================================================
+
+SEED        = 0
+C           = 1.0          # wave speed
+T_MAX       = 1.0
+EPOCHS      = 10000
+LR          = 1e-3
+MAX_DEG     = 75.0         # incidence range the angles are optimized over
+
+CENTER      = (0.5, 0.5)   # (0.5,0.5) hits every wall at normal incidence, where
+                           # all orders are near-perfect.  Try (0.32, 0.42) to get
+                           # a spread of incidence angles and separate the orders.
+SIGMA2      = 50.0         # initial bump exp(-SIGMA2 |r - center|^2)
+
+HARD_IC     = False        # u = u0 + t^2 * net  ->  initial data satisfied exactly
+AUX_MODE    = 'autodiff'   # 'autodiff': apply the n operators by nested autograd.
+                           # 'network' : carry w_1..w_{n-1} as extra outputs.  Cheaper
+                           #             for large n, but admits a spurious minimum in
+                           #             which w_j = 0 and the effective order drops.
+W_PDE, W_IC, W_BC = 1.0, 10.0, 5.0
+
+FOURIER_FEATURES = 0       # 0 disables it.  64 with FOURIER_SIGMA ~ 1-3 is the
+                           # lever to try if the bump stays under-resolved, but it
+                           # needs its own tuning - see the notes at the bottom.
+FOURIER_SIGMA    = 3.0
+WIDTH, DEPTH     = 64, 3
+
+N_PDE, N_IC, N_BC = 2000, 500, 300     # collocation points per step
+
+ORDERS = [1, 2, 3]
+
+
+# ============================================================
+#  1. absorption angles
+# ============================================================
+
+def reflection(theta_rad, angles_rad):
+    """|R(theta)| = prod_j |(cos t - cos t_j) / (cos t + cos t_j)|."""
+    mu = np.atleast_1d(np.cos(theta_rad))[:, None]
+    mu_j = np.cos(np.asarray(angles_rad))[None, :]
+    return np.prod(np.abs(mu - mu_j) / (mu + mu_j), axis=1)
+
+
+def optimize_angles(n, max_deg=MAX_DEG, n_restarts=40, seed=0):
+    """
+    Minimax angles over incidence [0, max_deg].  Returns (angles_rad, worst |R|).
+
+    The objective is a max over a grid and so is non-smooth; L-BFGS-B with
+    finite-difference gradients stalls on it.  Substituting v = log(cos theta)
+    turns each factor into tanh((v - v_j)/2), and multi-start Nelder-Mead on v
+    converges reliably.
+    """
+    lo = np.log(np.cos(np.radians(max_deg)))
+    v_grid = np.log(np.cos(np.radians(np.linspace(0.0, max_deg, 4001))))
+
+    def worst(v):
+        return np.max(np.prod(np.abs(np.tanh((v_grid[:, None] - v[None, :]) / 2)), axis=1))
+
+    rng = np.random.default_rng(seed)
+    best_f, best_v = np.inf, None
+    for _ in range(n_restarts):
+        v0 = np.sort(rng.uniform(lo, 0.0, n))
+        res = minimize(worst, v0, method='Nelder-Mead',
+                       options={'xatol': 1e-11, 'fatol': 1e-15,
+                                'maxiter': 50000, 'maxfev': 50000})
+        if res.fun < best_f:
+            best_f, best_v = res.fun, res.x
+    return np.sort(np.arccos(np.exp(best_v))), best_f
+
+
+# ============================================================
+#  2. free-space reference (finite differences on a padded domain)
+# ============================================================
+
+def reference_solution(times, h=0.005, c=C, pad=1.0,
+                       sigma2=SIGMA2, center=CENTER):
+    """
+    Leapfrog solution on [-pad, 1+pad]^2, large enough that nothing reflected off
+    its own edges reaches the unit square before t = pad / c.  This is what the
+    PINN should reproduce if its boundary condition were perfectly absorbing.
+
+    Returns (x_on_unit_square, {t: u_on_unit_square}).
+    """
+    x = np.arange(-pad, 1.0 + pad + h, h)
+    X, Y = np.meshgrid(x, x, indexing='ij')
+    dt = 0.5 * h / c
+    x0, y0 = center
+
+    def lap(u):
+        L = np.zeros_like(u)
+        L[1:-1, 1:-1] = (u[2:, 1:-1] + u[:-2, 1:-1]
+                         + u[1:-1, 2:] + u[1:-1, :-2] - 4 * u[1:-1, 1:-1]) / h ** 2
+        return L
+
+    u0 = np.exp(-sigma2 * ((X - x0) ** 2 + (Y - y0) ** 2))
+    um, u = u0.copy(), u0 + 0.5 * (c * dt) ** 2 * lap(u0)     # u_t(0) = 0
+
+    mask = (x >= 0) & (x <= 1)
+    targets = sorted(times)
+    snaps = {0.0: u0[np.ix_(mask, mask)].copy()} if 0.0 in targets else {}
+    for k in range(1, int(round(max(targets) / dt)) + 1):
+        u, um = 2 * u - um + (c * dt) ** 2 * lap(u), u
+        t = k * dt
+        for tt in targets:
+            if abs(t - tt) < dt / 2 and tt not in snaps:
+                snaps[tt] = u[np.ix_(mask, mask)].copy()
+    return x[mask], snaps
+
+
+# ============================================================
+#  3. model
+# ============================================================
+
+def u0_torch(x, y):
+    cx, cy = CENTER
+    return torch.exp(-SIGMA2 * ((x - cx) ** 2 + (y - cy) ** 2))
+
+
+class FourierFeatures(nn.Module):
+    """
+    Random Fourier embedding.  A plain tanh MLP has a strong low-frequency bias
+    and smooths away a bump of width 1/sqrt(SIGMA2); this lets it resolve one.
+    """
+
+    def __init__(self, in_dim=3, n_feat=64, sigma=3.0):
+        super().__init__()
+        self.register_buffer('B', torch.randn(in_dim, n_feat) * sigma)
+
+    def forward(self, x):
+        p = 2.0 * np.pi * (x @ self.B)
+        return torch.cat([torch.sin(p), torch.cos(p)], dim=-1)
+
+
+class HigdonPINN(nn.Module):
+    """
+    Output column 0 is the network part of u.  In 'network' aux mode the
+    remaining 4*(n-1) columns are the auxiliary fields w_1..w_{n-1}, one
+    independent set per face (they are different functions on each face).
+    """
+
+    def __init__(self, n, aux_mode=AUX_MODE, width=WIDTH, depth=DEPTH):
+        super().__init__()
+        self.n = n
+        self.aux_mode = aux_mode
+        self.aux_per_face = 0 if aux_mode == 'autodiff' else max(n - 1, 0)
+        out_dim = 1 + 4 * self.aux_per_face
+
+        if FOURIER_FEATURES:
+            self.embed = FourierFeatures(3, FOURIER_FEATURES, FOURIER_SIGMA)
+            in_dim = 2 * FOURIER_FEATURES
+        else:
+            self.embed = nn.Identity()
+            in_dim = 3
+
+        layers = [nn.Linear(in_dim, width), nn.Tanh()]
+        for _ in range(depth - 1):
+            layers += [nn.Linear(width, width), nn.Tanh()]
+        layers += [nn.Linear(width, out_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def raw(self, txy):
+        return self.net(self.embed(txy))
+
+    def u_from_raw(self, raw, txy):
+        base = raw[:, 0:1]
+        if not HARD_IC:
+            return base
+        t, x, y = txy[:, 0:1], txy[:, 1:2], txy[:, 2:3]
+        return u0_torch(x, y) + t ** 2 * base      # u(0)=u0 and u_t(0)=0 exactly
+
+    def u(self, txy):
+        return self.u_from_raw(self.raw(txy), txy)
+
+    def aux(self, raw, face, j):
+        """w_j on the given face, j = 1 .. n-1."""
+        col = 1 + face * self.aux_per_face + (j - 1)
+        return raw[:, col:col + 1]
+
+
+def grad(y, x):
+    return torch.autograd.grad(y, x, grad_outputs=torch.ones_like(y),
+                               create_graph=True)[0]
+
+
+# ============================================================
+#  4. losses
+# ============================================================
+
+FACES = [(1, 0.0, -1.0),    # (coordinate index in txy, value, outward normal sign)
+         (1, 1.0, +1.0),
+         (2, 0.0, -1.0),
+         (2, 1.0, +1.0)]
+
+EPS = 1e-12
+
+def pde_loss(model, num_points=N_PDE):
+    pts = torch.rand(num_points, 3) * torch.tensor([T_MAX, 1.0, 1.0])
+    txy = pts.detach().requires_grad_(True)
+
+    u = model.u(txy)
+    g = grad(u, txy)
+    u_t, u_x, u_y = g[:, 0:1], g[:, 1:2], g[:, 2:3]
+    u_tt = grad(u_t, txy)[:, 0:1]
+    u_xx = grad(u_x, txy)[:, 1:2]
+    u_yy = grad(u_y, txy)[:, 2:3]
+
+    lap = C ** 2 * (u_xx + u_yy)
+    return (u_tt - lap).pow(2).mean()
+
+
+def ic_loss(model, num_points=N_IC):
+    if HARD_IC:
+        return torch.zeros((), dtype=torch.float32)
+    xy = torch.rand(num_points, 2)
+    txy = torch.cat([torch.zeros(num_points, 1), xy], dim=1).requires_grad_(True)
+    u = model.u(txy)
+    u_t = grad(u, txy)[:, 0:1]
+    target = u0_torch(xy[:, 0:1], xy[:, 1:2])
+    return (u - target).pow(2).mean() + u_t.pow(2).mean()
+
+
+def bc_loss(model, cos_thetas, num_points=N_BC):
+    n = model.n
+    total = torch.zeros((), dtype=torch.float32)
+
+    for face, (dim, val, sign) in enumerate(FACES):
+        pts = torch.rand(num_points, 3)
+        pts[:, 0] *= T_MAX
+        pts[:, dim] = val
+        txy = pts.detach().requires_grad_(True)
+
+        raw = model.raw(txy)
+        w = model.u_from_raw(raw, txy)
+
+        for j in range(n):
+            g = grad(w, txy)
+            a = cos_thetas[j] * g[:, 0:1]          # cos(theta_j) * d_t w
+            b = C * sign * g[:, dim:dim + 1]       # c * d_nu w
+            op = a + b
+
+            if j == n - 1:
+                total = total + op.pow(2).mean()   # top of the chain: op = 0
+            elif model.aux_mode == 'autodiff':
+                w = op                             # keep differentiating
+            else:
+                w_next = model.aux(raw, face, j + 1)
+                total = total + (w_next - op).pow(2).mean()
+                w = w_next
+
+    return total / len(FACES)
+
+
+# ============================================================
+#  5. training
+# ============================================================
+
+def train(n, epochs=EPOCHS, verbose=True):
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
+    theta, max_R = optimize_angles(n)
+    cos_thetas = torch.tensor(np.cos(theta), dtype=torch.float32)
+    if verbose:
+        print(f'\n=== n = {n} ===')
+        print(f'  angles = {np.degrees(theta).round(1)} deg,  worst-case |R| = {max_R:.2e}')
+
+    model = HigdonPINN(n)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    for epoch in range(1, epochs + 1):
+        opt.zero_grad()
+        l_pde = pde_loss(model)
+        l_ic = ic_loss(model)
+        l_bc = bc_loss(model, cos_thetas)
+        (W_PDE * l_pde + W_IC * l_ic + W_BC * l_bc).backward()
+        opt.step()
+        sched.step()
+
+        if verbose and (epoch % max(epochs // 10, 1) == 0 or epoch == 1):
+            print(f'  epoch {epoch:6d} | pde {l_pde.item():.3e} '
+                  f'| ic {l_ic.item():.3e} | bc {l_bc.item():.3e}')
+
+    return model, cos_thetas, theta, max_R
+
+
+# ============================================================
+#  6. diagnostics
+# ============================================================
+
+@torch.no_grad()
+def eval_u(model, t, xs):
+    X, Y = np.meshgrid(xs, xs, indexing='ij')
+    pts = np.stack([np.full(X.size, t), X.ravel(), Y.ravel()], axis=1)
+    return model.u(torch.tensor(pts, dtype=torch.float32)).numpy().reshape(X.shape)
+
+
+def diagnose(model, cos_thetas, tag, n_times=41, stride=4, verbose=True):
+    """Relative L2 error against the free-space reference, as a function of t."""
+    times = [float(t) for t in np.round(np.linspace(0.025, T_MAX, n_times), 4)]
+    x_ref, snaps = reference_solution(times)
+    xs = x_ref[::stride]
+
+    rows = []
+    for t in times:
+        ref = snaps[t][::stride, ::stride]
+        pin = eval_u(model, t, xs)
+        rel = np.linalg.norm(pin - ref) / max(np.linalg.norm(ref), 1e-14)
+        rows.append((t, np.abs(pin).max(), np.abs(ref).max(), rel))
+    rows = np.array(rows)
+
+    late = rows[rows[:, 0] >= 0.7, 3].mean()
+    if verbose:
+        print('   t      max|u| PINN   max|u| ref   rel L2')
+        for t, a, b, r in rows[::8]:
+            print(f'   {t:.3f}    {a:.4f}        {b:.4f}       {r:.3f}')
+        print(f'   mean relative L2 error over t >= 0.7 : {late:.4f}')
+    check_aux(model, cos_thetas, verbose=verbose)
+    return rows, late
+
+
+def check_aux(model, cos_thetas, num_points=400, verbose=True):
+    """In 'network' mode, w_j = 0 is a spurious minimum that silently lowers the
+    effective order.  Compare each w_j against the operator it should equal."""
+    if model.aux_mode == 'autodiff' or model.n == 1 or not verbose:
+        return
+    print('   auxiliary chain (RMS on the boundary):')
+    for face, (dim, val, sign) in enumerate(FACES):
+        pts = torch.rand(num_points, 3)
+        pts[:, 0] *= T_MAX
+        pts[:, dim] = val
+        txy = pts.detach().requires_grad_(True)
+        raw = model.raw(txy)
+        w = model.u_from_raw(raw, txy)
+        msg = []
+        for j in range(model.n - 1):
+            g = grad(w, txy)
+            op = cos_thetas[j] * g[:, 0:1] + C * sign * g[:, dim:dim + 1]
+            w_next = model.aux(raw, face, j + 1)
+            msg.append(f'|w_{j+1}|={w_next.pow(2).mean().sqrt():.2e} '
+                       f'vs op {op.pow(2).mean().sqrt():.2e}')
+            w = w_next
+        print(f'     face {face}: ' + '   '.join(msg))
+
+
+def animate(model, tag, res=60, frames=60, fps=15):
+    """Surface animation with per-frame autoscaled limits - a fixed z range set by
+    the initial peak hides everything that happens after the pulse leaves."""
+    xs = np.linspace(0, 1, res)
+    X, Y = np.meshgrid(xs, xs, indexing='ij')
+    ts = np.linspace(0, T_MAX, frames)
+    fields = [eval_u(model, float(t), xs) for t in ts]
+
+    fig = plt.figure(figsize=(9, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    def update(k):
+        ax.clear()
+        f = fields[k]
+        lim = max(np.abs(f).max(), 1e-3) * 1.1
+        ax.plot_surface(X, Y, f, cmap='RdBu_r', vmin=-lim, vmax=lim, edgecolor='none')
+        ax.set_zlim(-lim, lim)
+        ax.set_title(f'{tag}   t = {ts[k]:.2f}   max|u| = {np.abs(f).max():.3f}')
+        ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('u')
+
+    FuncAnimation(fig, update, frames=frames, interval=80).save(
+        f'wave_{tag}.gif', writer='pillow', fps=fps)
+    plt.close(fig)
+
+
+# ============================================================
+#  7. run
+# ============================================================
+
+if __name__ == '__main__':
+    results = {}
+    for n in ORDERS:
+        model, cos_thetas, theta, max_R = train(n)
+        rows, late = diagnose(model, cos_thetas, tag=f'n{n}')
+        animate(model, tag=f'n{n}')
+        results[n] = dict(rows=rows, late=late, max_R=max_R, angles=np.degrees(theta))
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+    for n, r in results.items():
+        ax[0].plot(r['rows'][:, 0], r['rows'][:, 3], label=f"n={n} (|R|<={r['max_R']:.1e})")
+    ax[0].axvspan(0.4, T_MAX, color='0.92', zorder=0)
+    ax[0].set_xlabel('t'); ax[0].set_ylabel('relative L2 error vs free space')
+    ax[0].set_title('shaded: after the pulse reaches the wall'); ax[0].legend()
+
+    ns = sorted(results)
+    ax[1].semilogy(ns, [results[n]['late'] for n in ns], 'o-', label='PINN, t >= 0.7')
+    ax[1].semilogy(ns, [results[n]['max_R'] for n in ns], 's--', label='theoretical max|R|')
+    ax[1].set_xlabel('order n'); ax[1].set_xticks(ns); ax[1].legend()
+    ax[1].set_title('does the error follow the theory?')
+    fig.tight_layout(); fig.savefig('comparison.png', dpi=130)
+
+    print('\nsummary')
+    for n in ns:
+        r = results[n]
+        print(f'  n={n}  angles={r["angles"].round(1)}  '
+              f'max|R|={r["max_R"]:.2e}  late-time error={r["late"]:.4f}')
