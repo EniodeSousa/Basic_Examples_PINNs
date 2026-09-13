@@ -35,7 +35,7 @@ C           = 1.0          # wave speed
 T_MAX       = 1.0
 EPOCHS      = 10000
 LR          = 1e-3
-MAX_DEG     = 75.0         # incidence range the angles are optimized over
+MAX_DEG     = 50.0         # incidence range the angles are optimized over
 
 CENTER      = (0.5, 0.5)   # (0.5,0.5) hits every wall at normal incidence, where
                            # all orders are near-perfect.  Try (0.32, 0.42) to get
