@@ -11,8 +11,9 @@ epochs = 10000
 lr = 1e-3
 
 # Get optimal angles
-theta_opts = optimize_angles(n=n, max_deg=75.0)
+theta_opts, max_R = optimize_angles(n=n, max_deg=75.0)
 cos_thetas = torch.tensor(np.cos(theta_opts), dtype=torch.float32)
+print(f"n={n}  angles={np.degrees(theta_opts).round(1)}  worst-case |R|={max_R:.2e}")
 
 class HigdonPINN(nn.Module):
     def __init__(self, n_auxiliary: int):
