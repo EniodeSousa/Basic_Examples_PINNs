@@ -1,42 +1,33 @@
-from IPython.display import HTML
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+# Grid setup for animation
+res = 50
+x_g = np.linspace(0, 1, res)
+y_g = np.linspace(0, 1, res)
+X, Y = np.meshgrid(x_g, y_g)
+grid_xy = np.stack([X.ravel(), Y.ravel()], axis=1)
 
-# Grid setup
-grid_res = 40
-x_grid = np.linspace(0, 1, grid_res)
-y_grid = np.linspace(0, 1, grid_res)
-X, Y = np.meshgrid(x_grid, y_grid)
-x_flat = torch.tensor(X.flatten(), dtype=torch.float32).unsqueeze(1)
-y_flat = torch.tensor(Y.flatten(), dtype=torch.float32).unsqueeze(1)
+t_steps = 60
+t_vals = np.linspace(0, 1, t_steps)
 
-# Create figure and axis
-fig = plt.figure(figsize=(8, 6))
+fig = plt.figure(figsize=(10, 7))
 ax = fig.add_subplot(111, projection='3d')
-plt.close(fig)  # Suppresses the initial empty static plot window
 
-def update_surface(frame_idx):
+def update(frame):
     ax.clear()
-    t_val = frame_idx / 50.0
-    t_flat = torch.full_like(x_flat, t_val)
+    t_curr = t_vals[frame]
+    t_col = np.full((res * res, 1), t_curr)
+    txy_eval = torch.tensor(np.hstack([t_col, grid_xy]), dtype=torch.float32)
     
     with torch.no_grad():
-        u_pred, _ = model(t_flat, x_flat, y_flat)
-        Z = u_pred.numpy().reshape(grid_res, grid_res)
-
-    surf = ax.plot_surface(X, Y, Z, cmap='viridis', vmin=-0.5, vmax=1.0)
-    ax.set_zlim(-1.0, 1.0)
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('u(t, x, y)')
-    ax.set_title(f'PINN Wave Evolution t = {t_val:.2f}')
+        u_pred = model(txy_eval)[:, 0].numpy().reshape(res, res)
+        
+    surf = ax.plot_surface(X, Y, u_pred, cmap='viridis', edgecolor='none', vmin=-0.2, vmax=1.0)
+    ax.set_zlim(-0.3, 1.0)
+    ax.set_title(f"Wave Propagation with Order-{n} Absorbing BC (t = {t_curr:.2f})")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("u(t, x, y)")
     return surf,
 
-# Retain reference to anim in a global variable
-anim = FuncAnimation(fig, update_surface, frames=50, interval=60, blit=False)
-
-# Render interactive HTML controls inside Jupyter/Colab
-HTML(anim.to_jshtml())
-
-# Save animation to GIF using Pillow
-anim.save('wave_pinn.gif', writer='pillow', fps=20, dpi=100)
+anim = FuncAnimation(fig, update, frames=t_steps, interval=80, blit=False)
+anim.save("pinn_wave_3d_n=4.gif", writer="pillow", fps=15)
+plt.close()
