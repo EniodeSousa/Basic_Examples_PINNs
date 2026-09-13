@@ -1,19 +1,97 @@
+"""
+Helpers for the Higdon-ABC PINN experiment:
+
+  optimize_angles(n, max_deg)  -- minimax absorption angles (fixed optimizer)
+  reference_solution(...)      -- free-space FD reference on an enlarged domain
+  reflection_error(...)        -- quantitative metric to compare runs
+
+The angle problem is minimax over a product of rational factors, which is
+non-smooth; L-BFGS-B with finite-difference gradients stalls on it after a few
+iterations.  Substituting v = log(cos(theta)) turns each factor into
+tanh((v - v_j)/2), and a multi-start Nelder-Mead on v converges reliably.
+"""
+
 import numpy as np
 from scipy.optimize import minimize
 
-def optimize_angles(n: int, max_deg: float = 75.0) -> np.ndarray:
-    max_rad = np.radians(max_deg)
-    theta_grid = np.linspace(0, max_rad, 1000)
-    cos_theta = np.cos(theta_grid)[:, None]
 
-    def max_reflection(angles):
-        cos_angles = np.cos(angles)[None, :]
-        num = np.abs(cos_theta - cos_angles)
-        den = cos_theta + cos_angles
-        R = np.prod(num / den, axis=1)
-        return np.max(R)
+def reflection(theta_rad, angles_rad):
+    """|R(theta)| for the Higdon condition with the given absorption angles."""
+    mu = np.atleast_1d(np.cos(theta_rad))[:, None]
+    mu_j = np.cos(np.asarray(angles_rad))[None, :]
+    return np.prod(np.abs(mu - mu_j) / (mu + mu_j), axis=1)
 
-    x0 = np.linspace(0.05, max_rad - 0.05, n)
-    bounds = [(0.0, max_rad) for _ in range(n)]
-    res = minimize(max_reflection, x0, bounds=bounds, method='L-BFGS-B')
-    return np.sort(res.x)
+
+def optimize_angles(n, max_deg=75.0, n_restarts=40, seed=0):
+    """Minimax absorption angles (radians, sorted) over incidence [0, max_deg]."""
+    lo = np.log(np.cos(np.radians(max_deg)))
+    v_grid = np.log(np.cos(np.radians(np.linspace(0.0, max_deg, 4001))))
+
+    def worst(v):
+        return np.max(np.prod(np.abs(np.tanh((v_grid[:, None] - v[None, :]) / 2)), axis=1))
+
+    rng = np.random.default_rng(seed)
+    best_f, best_v = np.inf, None
+    for _ in range(n_restarts):
+        v0 = np.sort(rng.uniform(lo, 0.0, n))
+        res = minimize(worst, v0, method='Nelder-Mead',
+                       options={'xatol': 1e-11, 'fatol': 1e-15,
+                                'maxiter': 50000, 'maxfev': 50000})
+        if res.fun < best_f:
+            best_f, best_v = res.fun, res.x
+    return np.sort(np.arccos(np.exp(best_v))), best_f
+
+
+def reference_solution(times, h=0.004, c=1.0, pad=1.0, sigma2=50.0, center=(0.5, 0.5)):
+    """
+    Leapfrog FD solution of u_tt = c^2 Lap(u) with u(0) = exp(-sigma2 |r - r0|^2),
+    u_t(0) = 0, on [-pad, 1+pad]^2.  The domain is large enough that nothing
+    reflected off its edges reaches [0,1]^2 before t = pad / c.
+
+    Returns (x_unit, snapshots) where snapshots[t] is u on the unit square.
+    """
+    x = np.arange(-pad, 1.0 + pad + h, h)
+    X, Y = np.meshgrid(x, x, indexing='ij')
+    dt = 0.5 * h / c
+    x0, y0 = center
+
+    def lap(u):
+        L = np.zeros_like(u)
+        L[1:-1, 1:-1] = (u[2:, 1:-1] + u[:-2, 1:-1]
+                         + u[1:-1, 2:] + u[1:-1, :-2] - 4 * u[1:-1, 1:-1]) / h ** 2
+        return L
+
+    u0 = np.exp(-sigma2 * ((X - x0) ** 2 + (Y - y0) ** 2))
+    um, u = u0.copy(), u0 + 0.5 * (c * dt) ** 2 * lap(u0)
+
+    mask = (x >= 0) & (x <= 1)
+    targets, snaps = sorted(times), {}
+    nt = int(round(max(targets) / dt))
+    for k in range(1, nt + 1):
+        u, um = 2 * u - um + (c * dt) ** 2 * lap(u), u
+        t = k * dt
+        for tt in targets:
+            if abs(t - tt) < dt / 2 and tt not in snaps:
+                snaps[tt] = u[np.ix_(mask, mask)].copy()
+    return x[mask], snaps
+
+
+def reflection_error(u_pinn, u_ref):
+    """Relative L2 error on the unit square.  After the pulse has left, this is
+    dominated by the spurious reflection, so it is the number to compare across n."""
+    return np.linalg.norm(u_pinn - u_ref) / max(np.linalg.norm(u_ref), 1e-14)
+
+
+if __name__ == '__main__':
+    print('minimax angles over incidence [0, 75] degrees\n')
+    for n in range(1, 6):
+        ang, worst = optimize_angles(n)
+        naive = np.max(reflection(np.radians(np.linspace(0, 75, 4001)),
+                                  np.full(n, np.radians(3.0))))
+        print(f'  n={n}  angles = {np.round(np.degrees(ang), 1)}'
+              f'   max|R| = {worst:.2e}   (all near 3 deg: {naive:.3f})')
+
+    print('\nreference solution, max|u| on the unit square')
+    _, snaps = reference_solution([0.25, 0.5, 0.75, 1.0])
+    for t, f in sorted(snaps.items()):
+        print(f'  t={t:.2f}   max|u| = {np.abs(f).max():.4f}   min u = {f.min():+.4f}')
