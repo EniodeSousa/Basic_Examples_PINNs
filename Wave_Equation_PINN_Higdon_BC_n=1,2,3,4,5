@@ -7,13 +7,9 @@ Higdon absorbing boundary conditions for the 2D wave equation, solved with a PIN
 with u(0) a Gaussian bump at rest.  The theta_j are the angles of incidence at
 which the boundary absorbs exactly; they are chosen by a minimax criterion.
 
-Everything is in this one file - no imports between files.  Run it as
+Everything is in this one file - no imports between files. Run it as
 
     python wave_abc_pinn.py
-
-or paste it into a single notebook cell.  ORDERS at the bottom lists which n to
-train; each one is trained, diagnosed against a finite-difference reference, and
-animated, and a comparison plot is written at the end.
 """
 
 import numpy as np
@@ -33,26 +29,19 @@ from scipy.optimize import minimize
 SEED        = 0
 C           = 1.0          # wave speed
 T_MAX       = 1.0
-EPOCHS      = 10000
-LR          = 1e-3
+EPOCHS      = 12000        # slightly increased for stable convergence
+LR          = 5e-4         # reduced learning rate for stability under higher orders
 MAX_DEG     = 50.0         # incidence range the angles are optimized over
 
-CENTER      = (0.5, 0.5)   # (0.5,0.5) hits every wall at normal incidence, where
-                           # all orders are near-perfect.  Try (0.32, 0.42) to get
-                           # a spread of incidence angles and separate the orders.
+CENTER      = (0.5, 0.5)   # (0.5,0.5) hits every wall at normal incidence
 SIGMA2      = 50.0         # initial bump exp(-SIGMA2 |r - center|^2)
 
-HARD_IC     = False        # u = u0 + t^2 * net  ->  initial data satisfied exactly
-AUX_MODE    = 'autodiff'   # 'autodiff': apply the n operators by nested autograd.
-                           # 'network' : carry w_1..w_{n-1} as extra outputs.  Cheaper
-                           #             for large n, but admits a spurious minimum in
-                           #             which w_j = 0 and the effective order drops.
-W_PDE, W_IC, W_BC = 1.0, 10.0, 5.0
+HARD_IC     = True         # u = u0 + t^2 * net -> initial data satisfied exactly
+AUX_MODE    = 'network'    # 'network': avoids unstable deep nested autograd trees
+W_PDE, W_IC, W_BC = 1.0, 10.0, 1.0
 
-FOURIER_FEATURES = 0       # 0 disables it.  64 with FOURIER_SIGMA ~ 1-3 is the
-                           # lever to try if the bump stays under-resolved, but it
-                           # needs its own tuning - see the notes at the bottom.
-FOURIER_SIGMA    = 3.0
+FOURIER_FEATURES = 64      # enabled to overcome MLP spectral bias
+FOURIER_SIGMA    = 2.0
 WIDTH, DEPTH     = 64, 3
 
 N_PDE, N_IC, N_BC = 2000, 500, 300     # collocation points per step
@@ -73,12 +62,7 @@ def reflection(theta_rad, angles_rad):
 
 def optimize_angles(n, max_deg=MAX_DEG, n_restarts=40, seed=0):
     """
-    Minimax angles over incidence [0, max_deg].  Returns (angles_rad, worst |R|).
-
-    The objective is a max over a grid and so is non-smooth; L-BFGS-B with
-    finite-difference gradients stalls on it.  Substituting v = log(cos theta)
-    turns each factor into tanh((v - v_j)/2), and multi-start Nelder-Mead on v
-    converges reliably.
+    Minimax angles over incidence [0, max_deg]. Returns (angles_rad, worst |R|).
     """
     lo = np.log(np.cos(np.radians(max_deg)))
     v_grid = np.log(np.cos(np.radians(np.linspace(0.0, max_deg, 4001))))
@@ -106,10 +90,7 @@ def reference_solution(times, h=0.005, c=C, pad=1.0,
                        sigma2=SIGMA2, center=CENTER):
     """
     Leapfrog solution on [-pad, 1+pad]^2, large enough that nothing reflected off
-    its own edges reaches the unit square before t = pad / c.  This is what the
-    PINN should reproduce if its boundary condition were perfectly absorbing.
-
-    Returns (x_on_unit_square, {t: u_on_unit_square}).
+    its own edges reaches the unit square before t = pad / c.
     """
     x = np.arange(-pad, 1.0 + pad + h, h)
     X, Y = np.meshgrid(x, x, indexing='ij')
@@ -148,11 +129,10 @@ def u0_torch(x, y):
 
 class FourierFeatures(nn.Module):
     """
-    Random Fourier embedding.  A plain tanh MLP has a strong low-frequency bias
-    and smooths away a bump of width 1/sqrt(SIGMA2); this lets it resolve one.
+    Random Fourier embedding to resolve high-frequency spatial gradients.
     """
 
-    def __init__(self, in_dim=3, n_feat=64, sigma=3.0):
+    def __init__(self, in_dim=3, n_feat=64, sigma=2.0):
         super().__init__()
         self.register_buffer('B', torch.randn(in_dim, n_feat) * sigma)
 
@@ -162,11 +142,6 @@ class FourierFeatures(nn.Module):
 
 
 class HigdonPINN(nn.Module):
-    """
-    Output column 0 is the network part of u.  In 'network' aux mode the
-    remaining 4*(n-1) columns are the auxiliary fields w_1..w_{n-1}, one
-    independent set per face (they are different functions on each face).
-    """
 
     def __init__(self, n, aux_mode=AUX_MODE, width=WIDTH, depth=DEPTH):
         super().__init__()
@@ -216,12 +191,10 @@ def grad(y, x):
 #  4. losses
 # ============================================================
 
-FACES = [(1, 0.0, -1.0),    # (coordinate index in txy, value, outward normal sign)
+FACES = [(1, 0.0, -1.0),
          (1, 1.0, +1.0),
          (2, 0.0, -1.0),
          (2, 1.0, +1.0)]
-
-EPS = 1e-12
 
 def pde_loss(model, num_points=N_PDE):
     pts = torch.rand(num_points, 3) * torch.tensor([T_MAX, 1.0, 1.0])
@@ -326,7 +299,6 @@ def eval_u(model, t, xs):
 
 
 def diagnose(model, cos_thetas, tag, n_times=41, stride=4, verbose=True):
-    """Relative L2 error against the free-space reference, as a function of t."""
     times = [float(t) for t in np.round(np.linspace(0.025, T_MAX, n_times), 4)]
     x_ref, snaps = reference_solution(times)
     xs = x_ref[::stride]
@@ -350,8 +322,6 @@ def diagnose(model, cos_thetas, tag, n_times=41, stride=4, verbose=True):
 
 
 def check_aux(model, cos_thetas, num_points=400, verbose=True):
-    """In 'network' mode, w_j = 0 is a spurious minimum that silently lowers the
-    effective order.  Compare each w_j against the operator it should equal."""
     if model.aux_mode == 'autodiff' or model.n == 1 or not verbose:
         return
     print('   auxiliary chain (RMS on the boundary):')
@@ -374,8 +344,6 @@ def check_aux(model, cos_thetas, num_points=400, verbose=True):
 
 
 def animate(model, tag, res=60, frames=60, fps=15):
-    """Surface animation with per-frame autoscaled limits - a fixed z range set by
-    the initial peak hides everything that happens after the pulse leaves."""
     xs = np.linspace(0, 1, res)
     X, Y = np.meshgrid(xs, xs, indexing='ij')
     ts = np.linspace(0, T_MAX, frames)
