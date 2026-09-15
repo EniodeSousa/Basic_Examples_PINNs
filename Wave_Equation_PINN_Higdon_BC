@@ -1,6 +1,6 @@
 """
 Higdon absorbing boundary conditions for the 2D wave equation, solved with a PINN.
-Refactored with non-uniform time sampling, exact autodiff, and soft ICs.
+Refactored with time-marching curriculum learning, exact autodiff, and restored diagnostics.
 """
 
 import numpy as np
@@ -20,26 +20,27 @@ from scipy.optimize import minimize
 SEED            = 0
 C               = 1.0          # wave speed
 T_MAX           = 1.0
-EPOCHS          = 12000        
-LR              = 5e-4         
-MAX_DEG         = 50.0         # incidence range for optimized angles
+EPOCHS          = 4000         # time-marching made this worse; see notes
+LR              = 1e-3         
 
 CENTER          = (0.5, 0.5)   
-SIGMA2          = 20.0         # Widened pulse (was 50.0) to resolve late-time residue[cite: 2]
+SIGMA2          = 20.0         # Broader pulse (was 50.0) to smooth initial spatial derivatives
 
-HARD_IC         = False        # Soft ICs (was True) to eliminate early-time optimization stiffness[cite: 2]
-AUX_MODE        = 'autodiff'   # Direct autograd (was 'network') to prevent w_j chain collapse[cite: 2]
-NEUMANN_CONTROL = False        # Set True to run Neumann (|R|=1) diagnostic control test[cite: 2]
+HARD_IC         = False        # Soft ICs to prevent stiffness
+AUX_MODE        = 'autodiff'   # Forced autodiff mode to prevent w_j = 0 collapse
 
-W_PDE, W_IC, W_BC = 1.0, 10.0, 1.0
+REL_BC          = False        # False: absolute boundary residual (works at n=1,
+                               # diverges at n>=3).  True: scale-free (stable but
+                               # collapses).  Neither is solved for n>=2 yet.
+W_PDE, W_IC, W_BC = 1.0, 10.0, 5.0
 
-FOURIER_FEATURES = 64      
-FOURIER_SIGMA    = 2.0
+FOURIER_FEATURES = 0           # Disabled: Standard Tanh MLP preserves low-frequency content
 WIDTH, DEPTH     = 64, 3
 
 N_PDE, N_IC, N_BC = 2000, 500, 300     
 
 ORDERS = [1, 2, 3, 4, 5]
+EPS    = 1e-12
 
 
 # ============================================================
@@ -53,7 +54,7 @@ def reflection(theta_rad, angles_rad):
     return np.prod(np.abs(mu - mu_j) / (mu + mu_j), axis=1)
 
 
-def optimize_angles(n, max_deg=MAX_DEG, n_restarts=40, seed=0):
+def optimize_angles(n, max_deg=50.0, n_restarts=40, seed=0):
     lo = np.log(np.cos(np.radians(max_deg)))
     v_grid = np.log(np.cos(np.radians(np.linspace(0.0, max_deg, 4001))))
 
@@ -73,11 +74,14 @@ def optimize_angles(n, max_deg=MAX_DEG, n_restarts=40, seed=0):
 
 
 # ============================================================
-#  2. free-space reference (finite differences on a padded domain)
+#  2. free-space reference
 # ============================================================
 
-def reference_solution(times, h=0.005, c=C, pad=1.0,
-                       sigma2=SIGMA2, center=CENTER):
+def reference_solution(times, h=0.005, c=C, pad=1.0, sigma2=None, center=None):
+    # read the globals at call time - as default arguments they bind at import,
+    # and changing SIGMA2 afterwards silently gives a reference for another problem
+    sigma2 = SIGMA2 if sigma2 is None else sigma2
+    center = CENTER if center is None else center
     x = np.arange(-pad, 1.0 + pad + h, h)
     X, Y = np.meshgrid(x, x, indexing='ij')
     dt = 0.5 * h / c
@@ -113,16 +117,6 @@ def u0_torch(x, y):
     return torch.exp(-SIGMA2 * ((x - cx) ** 2 + (y - cy) ** 2))
 
 
-class FourierFeatures(nn.Module):
-    def __init__(self, in_dim=3, n_feat=64, sigma=2.0):
-        super().__init__()
-        self.register_buffer('B', torch.randn(in_dim, n_feat) * sigma)
-
-    def forward(self, x):
-        p = 2.0 * np.pi * (x @ self.B)
-        return torch.cat([torch.sin(p), torch.cos(p)], dim=-1)
-
-
 class HigdonPINN(nn.Module):
 
     def __init__(self, n, aux_mode=AUX_MODE, width=WIDTH, depth=DEPTH):
@@ -131,13 +125,7 @@ class HigdonPINN(nn.Module):
         self.aux_mode = aux_mode
         self.aux_per_face = 0 if aux_mode == 'autodiff' else max(n - 1, 0)
         out_dim = 1 + 4 * self.aux_per_face
-
-        if FOURIER_FEATURES:
-            self.embed = FourierFeatures(3, FOURIER_FEATURES, FOURIER_SIGMA)
-            in_dim = 2 * FOURIER_FEATURES
-        else:
-            self.embed = nn.Identity()
-            in_dim = 3
+        in_dim = 3
 
         layers = [nn.Linear(in_dim, width), nn.Tanh()]
         for _ in range(depth - 1):
@@ -146,7 +134,7 @@ class HigdonPINN(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def raw(self, txy):
-        return self.net(self.embed(txy))
+        return self.net(txy)
 
     def u_from_raw(self, raw, txy):
         base = raw[:, 0:1]
@@ -169,19 +157,26 @@ def grad(y, x):
 
 
 # ============================================================
-#  4. losses
+#  4. losses & normalization
 # ============================================================
+
+def _rel(residual, *parts):
+    """Boundary residual, scale-free when REL_BC (keeps every n on the same
+    footing, but leaves the constant solution as a zero-loss minimum)."""
+    if not REL_BC:
+        return residual.pow(2).mean()
+    scale = sum(p.pow(2).mean() for p in parts).detach() + EPS
+    return residual.pow(2).mean() / scale
+
 
 FACES = [(1, 0.0, -1.0),
          (1, 1.0, +1.0),
          (2, 0.0, -1.0),
          (2, 1.0, +1.0)]
 
-def pde_loss(model, num_points=N_PDE):
-    # Power-law sampling biases collocation points toward late times[cite: 2]
-    t = T_MAX * (torch.rand(num_points, 1) ** 0.7)
-    xy = torch.rand(num_points, 2)
-    pts = torch.cat([t, xy], dim=1)
+
+def pde_loss(model, t_max=T_MAX, num_points=N_PDE):
+    pts = torch.rand(num_points, 3) * torch.tensor([t_max, 1.0, 1.0])
     txy = pts.detach().requires_grad_(True)
 
     u = model.u(txy)
@@ -206,13 +201,13 @@ def ic_loss(model, num_points=N_IC):
     return (u - target).pow(2).mean() + u_t.pow(2).mean()
 
 
-def bc_loss(model, cos_thetas, num_points=N_BC):
+def bc_loss(model, cos_thetas, t_max=T_MAX, num_points=N_BC):
     n = model.n
     total = torch.zeros((), dtype=torch.float32)
 
     for face, (dim, val, sign) in enumerate(FACES):
         pts = torch.rand(num_points, 3)
-        pts[:, 0] = T_MAX * (pts[:, 0] ** 0.7)  # Match non-uniform time sampling
+        pts[:, 0] *= t_max
         pts[:, dim] = val
         txy = pts.detach().requires_grad_(True)
 
@@ -226,37 +221,39 @@ def bc_loss(model, cos_thetas, num_points=N_BC):
             op = a + b
 
             if j == n - 1:
-                total = total + op.pow(2).mean()   
+                total = total + _rel(op, a, b)
             elif model.aux_mode == 'autodiff':
                 w = op                             
             else:
                 w_next = model.aux(raw, face, j + 1)
-                total = total + (w_next - op).pow(2).mean()
+                total = total + _rel(w_next - op, w_next, op)
                 w = w_next
 
     return total / len(FACES)
 
 
 # ============================================================
-#  5. training
+#  5. training loop with time-marching
 # ============================================================
 
 def train(n, epochs=EPOCHS, verbose=True):
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    if NEUMANN_CONTROL:
-        # Control experiment: Neumann boundary conditions (cos(theta)=0)[cite: 2]
-        theta, max_R = np.zeros(n), 1.0
-        cos_thetas = torch.zeros(n, dtype=torch.float32)
-        if verbose:
-            print(f'\n=== n = {n} (NEUMANN CONTROL TEST) ===')
-    else:
-        theta, max_R = optimize_angles(n)
-        cos_thetas = torch.tensor(np.cos(theta), dtype=torch.float32)
-        if verbose:
-            print(f'\n=== n = {n} ===')
-            print(f'  angles = {np.degrees(theta).round(1)} deg,  worst-case |R| = {max_R:.2e}')
+    theta, max_R = optimize_angles(n)
+    cos_thetas = torch.tensor(np.cos(theta), dtype=torch.float32)
+
+    # the collapsed solution is u = mean(u0), whose ic loss is Var(u0) -- NOT
+    # mean(u0^2), which is larger and lets a fully collapsed run report "OK"
+    xs = torch.linspace(0, 1, 400)
+    X, Y = torch.meshgrid(xs, xs, indexing='ij')
+    u0g = u0_torch(X, Y)
+    collapse_ic = float(u0g.pow(2).mean() - u0g.mean() ** 2)
+
+    if verbose:
+        print(f'\n=== n = {n} ===')
+        print(f'  angles = {np.degrees(theta).round(1)} deg, worst-case |R| = {max_R:.2e}')
+        print(f'  ic loss of the collapsed (constant) solution: {collapse_ic:.4f}')
 
     model = HigdonPINN(n)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
@@ -272,14 +269,15 @@ def train(n, epochs=EPOCHS, verbose=True):
         sched.step()
 
         if verbose and (epoch % max(epochs // 10, 1) == 0 or epoch == 1):
+            flag = ' <-- COLLAPSING' if l_ic.item() >= 0.5 * collapse_ic else ''
             print(f'  epoch {epoch:6d} | pde {l_pde.item():.3e} '
-                  f'| ic {l_ic.item():.3e} | bc {l_bc.item():.3e}')
+                  f'| ic {l_ic.item():.3e} | bc {l_bc.item():.3e}{flag}')
 
     return model, cos_thetas, theta, max_R
 
 
 # ============================================================
-#  6. diagnostics & entry point
+#  6. evaluation & diagnostics
 # ============================================================
 
 @torch.no_grad()
@@ -287,6 +285,28 @@ def eval_u(model, t, xs):
     X, Y = np.meshgrid(xs, xs, indexing='ij')
     pts = np.stack([np.full(X.size, t), X.ravel(), Y.ravel()], axis=1)
     return model.u(torch.tensor(pts, dtype=torch.float32)).numpy().reshape(X.shape)
+
+
+def check_aux(model, cos_thetas, num_points=400, verbose=True):
+    """Restored diagnostic check for boundary chain operator magnitudes."""
+    if model.aux_mode == 'autodiff' or model.n == 1 or not verbose:
+        return
+    print('   auxiliary chain (RMS on the boundary):')
+    for face, (dim, val, sign) in enumerate(FACES):
+        pts = torch.rand(num_points, 3)
+        pts[:, 0] *= T_MAX
+        pts[:, dim] = val
+        txy = pts.detach().requires_grad_(True)
+        raw = model.raw(txy)
+        w = model.u_from_raw(raw, txy)
+        msg = []
+        for j in range(model.n - 1):
+            g = grad(w, txy)
+            op = cos_thetas[j] * g[:, 0:1] + C * sign * g[:, dim:dim + 1]
+            w_next = model.aux(raw, face, j + 1)
+            msg.append(f'|w_{j+1}|={w_next.pow(2).mean().sqrt():.2e} vs op {op.pow(2).mean().sqrt():.2e}')
+            w = w_next
+        print(f'     face {face}: ' + '   '.join(msg))
 
 
 def diagnose(model, cos_thetas, tag, n_times=41, stride=4, verbose=True):
@@ -308,14 +328,44 @@ def diagnose(model, cos_thetas, tag, n_times=41, stride=4, verbose=True):
         for t, a, b, r in rows[::8]:
             print(f'   {t:.3f}    {a:.4f}        {b:.4f}       {r:.3f}')
         print(f'   mean relative L2 error over t >= 0.7 : {late:.4f}')
+    check_aux(model, cos_thetas, verbose=verbose)
     return rows, late
 
+
+def animate(model, tag, res=60, frames=60, fps=15):
+    """Restored animation routine to produce output GIFs."""
+    xs = np.linspace(0, 1, res)
+    X, Y = np.meshgrid(xs, xs, indexing='ij')
+    ts = np.linspace(0, T_MAX, frames)
+    fields = [eval_u(model, float(t), xs) for t in ts]
+
+    fig = plt.figure(figsize=(9, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    def update(k):
+        ax.clear()
+        f = fields[k]
+        lim = max(np.abs(f).max(), 1e-3) * 1.1
+        ax.plot_surface(X, Y, f, cmap='RdBu_r', vmin=-lim, vmax=lim, edgecolor='none')
+        ax.set_zlim(-lim, lim)
+        ax.set_title(f'{tag}   t = {ts[k]:.2f}   max|u| = {np.abs(f).max():.3f}')
+        ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('u')
+
+    FuncAnimation(fig, update, frames=frames, interval=80).save(
+        f'wave_{tag}.gif', writer='pillow', fps=fps)
+    plt.close(fig)
+
+
+# ============================================================
+#  7. execution entry point
+# ============================================================
 
 if __name__ == '__main__':
     results = {}
     for n in ORDERS:
         model, cos_thetas, theta, max_R = train(n)
         rows, late = diagnose(model, cos_thetas, tag=f'n{n}')
+        animate(model, tag=f'n{n}')
         results[n] = dict(rows=rows, late=late, max_R=max_R, angles=np.degrees(theta))
 
     fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
