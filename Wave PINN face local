@@ -1,0 +1,350 @@
+"""
+Higdon absorbing boundary conditions in face-local auxiliary form, for a PINN.
+
+Volume unknown  u(t,x,y).
+On each face, auxiliary fields psi_1..psi_{n-1}(t,s), s = the tangential coordinate:
+
+    psi_n     := u|_Gamma
+    psi_{n-1}  = mu_n d_t u + c d_nu u                                  (top link)
+    psi_{j-2}  = (mu_{j-1}+mu_j) d_t psi_{j-1}
+                 + sin^2(th_j) d_tt psi_j - c^2 d_ss psi_j     j = n..2  (recursion)
+    psi_0      = 0                                                      (closure)
+    psi_j = d_t psi_j = 0 at t = 0
+
+mu_j = cos(theta_j).  Verified symbolically (n = 1,2,3) to reproduce
+R = prod_j (cos th - mu_j)/(cos th + mu_j), i.e. it is the Higdon condition exactly.
+
+Only one normal derivative appears anywhere, and nothing is above second order at
+any n -- which is the point: no k^(2n) loss-scale blow-up, and the boundary carries
+its own initial-value problem instead of a bare n-th order operator.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy.optimize import minimize
+
+# ============================================================
+#  configuration
+# ============================================================
+
+SEED    = 0
+C       = 1.0
+T_MAX   = 1.0
+EPOCHS  = 4000
+LR      = 1e-3
+MAX_DEG = 50.0
+
+CENTER  = (0.5, 0.5)
+SIGMA2  = 20.0
+
+WIDTH, DEPTH        = 64, 3      # volume net
+FACE_WIDTH, FACE_DEPTH = 48, 3   # per-face auxiliary net
+
+W_PDE, W_IC, W_BC, W_FACE_IC = 1.0, 10.0, 5.0, 10.0
+N_PDE, N_IC, N_BC = 2000, 500, 300
+
+ORDERS = [1, 2, 3]
+
+# (index of the fixed coordinate in txy, its value, outward normal sign)
+FACES = [(1, 0.0, -1.0), (1, 1.0, +1.0), (2, 0.0, -1.0), (2, 1.0, +1.0)]
+
+
+# ============================================================
+#  angles, reference solution
+# ============================================================
+
+def optimize_angles(n, max_deg=MAX_DEG, n_restarts=40, seed=0):
+    lo = np.log(np.cos(np.radians(max_deg)))
+    v_grid = np.log(np.cos(np.radians(np.linspace(0.0, max_deg, 4001))))
+
+    def worst(v):
+        return np.max(np.prod(np.abs(np.tanh((v_grid[:, None] - v[None, :]) / 2)), axis=1))
+
+    rng = np.random.default_rng(seed)
+    best_f, best_v = np.inf, None
+    for _ in range(n_restarts):
+        res = minimize(worst, np.sort(rng.uniform(lo, 0.0, n)), method='Nelder-Mead',
+                       options={'xatol': 1e-11, 'fatol': 1e-15,
+                                'maxiter': 50000, 'maxfev': 50000})
+        if res.fun < best_f:
+            best_f, best_v = res.fun, res.x
+    return np.sort(np.arccos(np.exp(best_v))), best_f
+
+
+def reference_solution(times, h=0.005, c=C, pad=1.0, sigma2=None, center=None):
+    sigma2 = SIGMA2 if sigma2 is None else sigma2
+    center = CENTER if center is None else center
+    x = np.arange(-pad, 1.0 + pad + h, h)
+    X, Y = np.meshgrid(x, x, indexing='ij')
+    dt = 0.5 * h / c
+    x0, y0 = center
+
+    def lap(u):
+        L = np.zeros_like(u)
+        L[1:-1, 1:-1] = (u[2:, 1:-1] + u[:-2, 1:-1]
+                         + u[1:-1, 2:] + u[1:-1, :-2] - 4 * u[1:-1, 1:-1]) / h ** 2
+        return L
+
+    u0 = np.exp(-sigma2 * ((X - x0) ** 2 + (Y - y0) ** 2))
+    um, u = u0.copy(), u0 + 0.5 * (c * dt) ** 2 * lap(u0)
+    mask = (x >= 0) & (x <= 1)
+    targets, snaps = sorted(times), {}
+    for k in range(1, int(round(max(targets) / dt)) + 1):
+        u, um = 2 * u - um + (c * dt) ** 2 * lap(u), u
+        t = k * dt
+        for tt in targets:
+            if abs(t - tt) < dt / 2 and tt not in snaps:
+                snaps[tt] = u[np.ix_(mask, mask)].copy()
+    return x[mask], snaps
+
+
+# ============================================================
+#  networks
+# ============================================================
+
+def u0_torch(x, y):
+    cx, cy = CENTER
+    return torch.exp(-SIGMA2 * ((x - cx) ** 2 + (y - cy) ** 2))
+
+
+def mlp(in_dim, out_dim, width, depth):
+    layers = [nn.Linear(in_dim, width), nn.Tanh()]
+    for _ in range(depth - 1):
+        layers += [nn.Linear(width, width), nn.Tanh()]
+    return nn.Sequential(*layers, nn.Linear(width, out_dim))
+
+
+class FaceLocalPINN(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
+        self.volume = mlp(3, 1, WIDTH, DEPTH)
+        # one auxiliary net per face, (t, s) -> psi_1..psi_{n-1}
+        self.faces = nn.ModuleList([mlp(2, max(n - 1, 1), FACE_WIDTH, FACE_DEPTH)
+                                    for _ in range(4)]) if n > 1 else None
+
+    def u(self, txy):
+        return self.volume(txy)
+
+    def psi(self, face, ts):
+        return self.faces[face](ts)
+
+
+def grad(y, x):
+    return torch.autograd.grad(y, x, grad_outputs=torch.ones_like(y),
+                               create_graph=True)[0]
+
+
+# ============================================================
+#  losses
+# ============================================================
+
+def pde_loss(model, num_points=N_PDE):
+    pts = torch.rand(num_points, 3) * torch.tensor([T_MAX, 1.0, 1.0])
+    txy = pts.detach().requires_grad_(True)
+    u = model.u(txy)
+    g = grad(u, txy)
+    u_tt = grad(g[:, 0:1], txy)[:, 0:1]
+    u_xx = grad(g[:, 1:2], txy)[:, 1:2]
+    u_yy = grad(g[:, 2:3], txy)[:, 2:3]
+    return (u_tt - C ** 2 * (u_xx + u_yy)).pow(2).mean()
+
+
+def ic_loss(model, num_points=N_IC):
+    xy = torch.rand(num_points, 2)
+    txy = torch.cat([torch.zeros(num_points, 1), xy], dim=1).requires_grad_(True)
+    u = model.u(txy)
+    u_t = grad(u, txy)[:, 0:1]
+    target = u0_torch(xy[:, 0:1], xy[:, 1:2])
+    return (u - target).pow(2).mean() + u_t.pow(2).mean()
+
+
+def bc_loss(model, cos_thetas, num_points=N_BC):
+    """Top link + recursion + closure, on all four faces."""
+    n = model.n
+    mu = cos_thetas
+    sin2 = 1.0 - mu ** 2
+    total = torch.zeros(())
+
+    for face, (dim, val, sign) in enumerate(FACES):
+        other = 3 - dim                      # the tangential coordinate index
+        raw = torch.rand(num_points, 3)
+        raw[:, 0] *= T_MAX
+        raw[:, dim] = val
+        txy = raw.detach().requires_grad_(True)
+
+        # traces of the volume field on this face
+        u = model.u(txy)
+        g = grad(u, txy)
+        u_t = g[:, 0:1]
+        u_nu = sign * g[:, dim:dim + 1]
+        u_tt = grad(u_t, txy)[:, 0:1]
+        u_ss = grad(g[:, other:other + 1], txy)[:, other:other + 1]
+
+        if n == 1:
+            total = total + (mu[0] * u_t + C * u_nu).pow(2).mean()
+            continue
+
+        # auxiliary fields on this face, as functions of (t, s)
+        ts = torch.stack([txy[:, 0], txy[:, other]], dim=1).detach().requires_grad_(True)
+        psi = model.psi(face, ts)
+        psi_t, psi_tt, psi_ss = [], [], []
+        for k in range(n - 1):
+            gk = grad(psi[:, k:k + 1], ts)
+            psi_t.append(gk[:, 0:1])
+            psi_tt.append(grad(gk[:, 0:1], ts)[:, 0:1])
+            psi_ss.append(grad(gk[:, 1:2], ts)[:, 1:2])
+
+        def P(k):        # psi_k and its derivatives; k = 0 .. n
+            if k == 0:
+                z = torch.zeros_like(u)
+                return z, z, z, z
+            if k == n:
+                return u, u_t, u_tt, u_ss
+            i = k - 1
+            return psi[:, i:i + 1], psi_t[i], psi_tt[i], psi_ss[i]
+
+        # top link: psi_{n-1} = mu_n d_t u + c d_nu u
+        total = total + (P(n - 1)[0] - (mu[n - 1] * u_t + C * u_nu)).pow(2).mean()
+
+        # recursion, j = n .. 2 (j = 2 closes the chain with psi_0 = 0)
+        for j in range(n, 1, -1):
+            _, dt_jm1, _, _ = P(j - 1)
+            _, _, tt_j, ss_j = P(j)
+            rhs = (mu[j - 2] + mu[j - 1]) * dt_jm1 + sin2[j - 1] * tt_j - C ** 2 * ss_j
+            total = total + (P(j - 2)[0] - rhs).pow(2).mean()
+
+    return total / len(FACES)
+
+
+def face_ic_loss(model, num_points=N_IC):
+    """psi_j = d_t psi_j = 0 at t = 0: the boundary carries its own initial data."""
+    if model.n == 1:
+        return torch.zeros(())
+    total = torch.zeros(())
+    for face in range(4):
+        s = torch.rand(num_points, 1)
+        ts = torch.cat([torch.zeros(num_points, 1), s], dim=1).requires_grad_(True)
+        psi = model.psi(face, ts)
+        loss = psi.pow(2).mean()
+        for k in range(model.n - 1):
+            loss = loss + grad(psi[:, k:k + 1], ts)[:, 0:1].pow(2).mean()
+        total = total + loss
+    return total / 4
+
+
+# ============================================================
+#  training and diagnostics
+# ============================================================
+
+def train(n, epochs=EPOCHS, verbose=True):
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    theta, max_R = optimize_angles(n)
+    cos_thetas = torch.tensor(np.cos(theta), dtype=torch.float32)
+
+    xs = torch.linspace(0, 1, 400)
+    X, Y = torch.meshgrid(xs, xs, indexing='ij')
+    u0g = u0_torch(X, Y)
+    collapse_ic = float(u0g.pow(2).mean() - u0g.mean() ** 2)
+
+    if verbose:
+        print(f'\n=== n = {n} ===  angles {np.degrees(theta).round(1)} '
+              f' max|R| {max_R:.2e}   (collapsed-solution ic = {collapse_ic:.4f})')
+
+    model = FaceLocalPINN(n)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    for epoch in range(1, epochs + 1):
+        opt.zero_grad()
+        l_pde, l_ic = pde_loss(model), ic_loss(model)
+        l_bc, l_fic = bc_loss(model, cos_thetas), face_ic_loss(model)
+        (W_PDE * l_pde + W_IC * l_ic + W_BC * l_bc + W_FACE_IC * l_fic).backward()
+        opt.step()
+        sched.step()
+        if verbose and (epoch % max(epochs // 8, 1) == 0 or epoch == 1):
+            flag = ' <-- COLLAPSING' if l_ic.item() >= 0.5 * collapse_ic else ''
+            print(f'  epoch {epoch:5d} | pde {l_pde.item():.3e} | ic {l_ic.item():.3e} '
+                  f'| bc {l_bc.item():.3e} | face-ic {l_fic.item():.3e}{flag}')
+
+    return model, cos_thetas, theta, max_R
+
+
+@torch.no_grad()
+def eval_u(model, t, xs):
+    X, Y = np.meshgrid(xs, xs, indexing='ij')
+    pts = np.stack([np.full(X.size, t), X.ravel(), Y.ravel()], axis=1)
+    return model.u(torch.tensor(pts, dtype=torch.float32)).numpy().reshape(X.shape)
+
+
+def diagnose(model, tag, n_times=41, stride=4, verbose=True):
+    times = [float(t) for t in np.round(np.linspace(0.025, T_MAX, n_times), 4)]
+    x_ref, snaps = reference_solution(times)
+    xs = x_ref[::stride]
+    rows = []
+    for t in times:
+        ref = snaps[t][::stride, ::stride]
+        pin = eval_u(model, t, xs)
+        rows.append((t, np.abs(pin).max(), np.abs(ref).max(),
+                     np.linalg.norm(pin - ref) / max(np.linalg.norm(ref), 1e-14)))
+    rows = np.array(rows)
+    late = rows[rows[:, 0] >= 0.7, 3].mean()
+    if verbose:
+        print('   t      max|u| PINN   max|u| ref   rel L2')
+        for t, a, b, r in rows[::8]:
+            print(f'   {t:.3f}    {a:.4f}        {b:.4f}       {r:.3f}')
+        print(f'   mean relative L2 error over t >= 0.7 : {late:.4f}')
+    return rows, late
+
+
+def animate(model, tag, res=60, frames=60, fps=15):
+    xs = np.linspace(0, 1, res)
+    X, Y = np.meshgrid(xs, xs, indexing='ij')
+    ts = np.linspace(0, T_MAX, frames)
+    fields = [eval_u(model, float(t), xs) for t in ts]
+    fig = plt.figure(figsize=(9, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    def update(k):
+        ax.clear()
+        f = fields[k]
+        lim = max(np.abs(f).max(), 1e-3) * 1.1
+        ax.plot_surface(X, Y, f, cmap='RdBu_r', vmin=-lim, vmax=lim, edgecolor='none')
+        ax.set_zlim(-lim, lim)
+        ax.set_title(f'{tag}   t = {ts[k]:.2f}   max|u| = {np.abs(f).max():.3f}')
+        ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('u')
+
+    FuncAnimation(fig, update, frames=frames, interval=80).save(
+        f'wave_{tag}.gif', writer='pillow', fps=fps)
+    plt.close(fig)
+
+
+if __name__ == '__main__':
+    results = {}
+    for n in ORDERS:
+        model, ct, theta, max_R = train(n)
+        rows, late = diagnose(model, f'n{n}')
+        animate(model, f'n{n}')
+        results[n] = dict(rows=rows, late=late, max_R=max_R)
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+    for n, r in results.items():
+        ax[0].plot(r['rows'][:, 0], r['rows'][:, 3], label=f"n={n}")
+    ax[0].axvspan(0.4, T_MAX, color='0.92', zorder=0)
+    ax[0].set_xlabel('t'); ax[0].set_ylabel('relative L2 vs free space'); ax[0].legend()
+    ns = sorted(results)
+    ax[1].semilogy(ns, [results[n]['late'] for n in ns], 'o-', label='PINN, t >= 0.7')
+    ax[1].semilogy(ns, [results[n]['max_R'] for n in ns], 's--', label='theoretical max|R|')
+    ax[1].set_xlabel('order n'); ax[1].set_xticks(ns); ax[1].legend()
+    fig.tight_layout(); fig.savefig('comparison.png', dpi=130)
+
+    print('\nsummary')
+    for n in ns:
+        print(f'  n={n}  max|R|={results[n]["max_R"]:.2e}  '
+              f'late-time error={results[n]["late"]:.4f}')
