@@ -1,0 +1,252 @@
+"""
+Minimal test: at n = 1, does the PINN interior solution track free space at all?
+
+One order, one seed, fixed loss weights, uniform collocation, hard-constrained
+initial data.  The ONLY thing that varies is Fourier features on/off.
+
+Everything else that was on the table -- the gradient-norm balancer, wavefront
+importance sampling, per-face auxiliary nets, n > 1 -- is deliberately absent.
+If this test fails, none of those are measurable yet.
+
+Pass/fail, read off the printed table:
+  max|u| PINN within ~10% of max|u| ref through t = 0.5   -> interior is fine,
+                                                             go on to n >= 2
+  PINN amplitude flat, or far below ref                   -> interior is the wall
+
+T_MAX = 0.6: the wavefront first reaches a face at t = 0.5 (c = 1, distance 0.5),
+so almost this whole window is an interior test with the boundary barely engaged.
+
+Runtime: a few minutes per arm on CPU.
+"""
+
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------------
+#  configuration
+# ------------------------------------------------------------------
+
+SEED      = 0
+C         = 1.0
+SIGMA_SQ  = 80.0          # d_nu u0 on the faces ~ 1.7e-7, i.e. quiescent
+CENTER    = (0.5, 0.5)
+T_MAX     = 0.6
+
+THETA_DEG = 36.7          # the n = 1 minimax angle from your sweep
+MU        = float(np.cos(np.radians(THETA_DEG)))
+
+EPOCHS    = 6000
+LR        = 1e-3
+N_PDE     = 3000
+N_BC      = 400
+W_PDE, W_BC = 1.0, 1.0    # fixed, and defensible because the PDE residual is
+                          # normalised by R0 below -- both terms are then O(1)
+
+WIDTH, DEPTH = 128, 4
+FF_FEATURES  = 64         # number of random Fourier directions
+FF_SCALE     = 3.0        # std of B, in CYCLES per unit length.
+                          # u0-hat ~ exp(-|k|^2/(4*SIGMA_SQ)) is down to 1% by
+                          # |k| ~ 38 rad/unit ~ 6 cycles/unit, so a row norm of
+                          # 3*sqrt(3) ~ 5.2 covers the signal without wasting
+                          # capacity on frequencies the PDE residual amplifies.
+
+# u = u0 + t^2 * OUT_SCALE * N.  Near t = 0 the exact solution needs
+# u_tt = c^2 * lap(u0), whose peak is 2*c^2*SIGMA_SQ = 160, so N must reach
+# O(160).  Without OUT_SCALE a default-initialised net starts ~160x too small.
+OUT_SCALE = 2.0 * C ** 2 * SIGMA_SQ
+
+# PDE residual normaliser, same scale, so the loss is O(1) at initialisation.
+R0 = 2.0 * C ** 2 * SIGMA_SQ
+
+TIMES = np.round(np.linspace(0.05, T_MAX, 12), 4)
+
+# (index into (t,x,y) of the fixed coordinate, its value, outward normal sign)
+FACES = [(1, 0.0, -1.0), (1, 1.0, 1.0), (2, 0.0, -1.0), (2, 1.0, 1.0)]
+
+DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ------------------------------------------------------------------
+#  free-space reference (2nd-order leapfrog on a padded grid)
+# ------------------------------------------------------------------
+
+def reference(times, h=0.005, pad=0.8):
+    x = np.arange(-pad, 1.0 + pad + h / 2, h)
+    X, Y = np.meshgrid(x, x, indexing="ij")
+    dt = 0.5 * h / C                       # CFL 0.5 < 1/sqrt(2), stable in 2D
+    x0, y0 = CENTER
+
+    def lap(u):
+        L = np.zeros_like(u)
+        L[1:-1, 1:-1] = (u[2:, 1:-1] + u[:-2, 1:-1]
+                         + u[1:-1, 2:] + u[1:-1, :-2] - 4 * u[1:-1, 1:-1]) / h ** 2
+        return L
+
+    u0 = np.exp(-SIGMA_SQ * ((X - x0) ** 2 + (Y - y0) ** 2))
+    um, u = u0.copy(), u0 + 0.5 * (C * dt) ** 2 * lap(u0)   # u_t(0) = 0
+    mask = (x >= -1e-12) & (x <= 1 + 1e-12)
+    snaps, targets = {}, sorted(float(t) for t in times)
+
+    for k in range(1, int(round(max(targets) / dt)) + 1):
+        u, um = 2 * u - um + (C * dt) ** 2 * lap(u), u
+        t = k * dt
+        for tt in targets:
+            if abs(t - tt) < dt / 2 and tt not in snaps:
+                snaps[tt] = u[np.ix_(mask, mask)].copy()
+
+    missing = [t for t in targets if t not in snaps]
+    if missing:
+        raise RuntimeError(f"reference missed snapshots at {missing}")
+    return x[mask], snaps
+
+
+# ------------------------------------------------------------------
+#  model
+# ------------------------------------------------------------------
+
+def u0_torch(x, y):
+    cx, cy = CENTER
+    return torch.exp(-SIGMA_SQ * ((x - cx) ** 2 + (y - cy) ** 2))
+
+
+class PINN(nn.Module):
+    """u(t,x,y) = u0(x,y) + t^2 * OUT_SCALE * N(t,x,y).
+
+    u(0,.) = u0 and u_t(0,.) = 0 hold identically, so there is no IC loss and
+    no trivial solution to collapse onto.
+    """
+
+    def __init__(self, fourier):
+        super().__init__()
+        self.fourier = fourier
+        if fourier:
+            self.register_buffer("B", torch.randn(3, FF_FEATURES) * FF_SCALE)
+            in_dim = 2 * FF_FEATURES
+        else:
+            in_dim = 3
+        layers = [nn.Linear(in_dim, WIDTH), nn.Tanh()]
+        for _ in range(DEPTH - 1):
+            layers += [nn.Linear(WIDTH, WIDTH), nn.Tanh()]
+        layers += [nn.Linear(WIDTH, 1)]
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, txy):
+        if self.fourier:
+            p = 2.0 * np.pi * (txy @ self.B)
+            h = torch.cat([torch.sin(p), torch.cos(p)], dim=-1)
+        else:
+            h = txy
+        t, x, y = txy[:, 0:1], txy[:, 1:2], txy[:, 2:3]
+        return u0_torch(x, y) + (t ** 2) * OUT_SCALE * self.mlp(h)
+
+
+def d(y, x):
+    return torch.autograd.grad(y, x, torch.ones_like(y), create_graph=True)[0]
+
+
+# ------------------------------------------------------------------
+#  losses
+# ------------------------------------------------------------------
+
+def pde_loss(model):
+    scale = torch.tensor([T_MAX, 1.0, 1.0], device=DEV)
+    txy = (torch.rand(N_PDE, 3, device=DEV) * scale).requires_grad_(True)
+    u = model(txy)
+    g = d(u, txy)
+    u_tt = d(g[:, 0:1], txy)[:, 0:1]
+    u_xx = d(g[:, 1:2], txy)[:, 1:2]
+    u_yy = d(g[:, 2:3], txy)[:, 2:3]
+    return ((u_tt - C ** 2 * (u_xx + u_yy)) / R0).pow(2).mean()
+
+
+def bc_loss(model):
+    """n = 1 Higdon: mu * u_t + c * d_nu u = 0 on each face."""
+    total = torch.zeros((), device=DEV)
+    for dim, val, sign in FACES:
+        raw = torch.rand(N_BC, 3, device=DEV)
+        raw[:, 0] *= T_MAX
+        raw[:, dim] = val
+        txy = raw.detach().requires_grad_(True)
+        g = d(model(txy), txy)
+        r = MU * g[:, 0:1] + C * sign * g[:, dim:dim + 1]
+        total = total + r.pow(2).mean()
+    return total / len(FACES)
+
+
+# ------------------------------------------------------------------
+#  train / evaluate
+# ------------------------------------------------------------------
+
+@torch.no_grad()
+def eval_grid(model, t, xs):
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    pts = np.stack([np.full(X.size, t), X.ravel(), Y.ravel()], axis=1)
+    out = model(torch.tensor(pts, dtype=torch.float32, device=DEV))
+    return out.cpu().numpy().reshape(X.shape)
+
+
+def run(fourier, xs, snaps):
+    tag = "fourier" if fourier else "plain"
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
+    model = PINN(fourier).to(DEV)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+
+    print(f"\n=== {tag} ===  params {sum(p.numel() for p in model.parameters()):,}"
+          f"  device {DEV}")
+    t0 = time.time()
+    for epoch in range(1, EPOCHS + 1):
+        opt.zero_grad()
+        lp, lb = pde_loss(model), bc_loss(model)
+        (W_PDE * lp + W_BC * lb).backward()
+        opt.step()
+        sched.step()
+        if epoch % (EPOCHS // 6) == 0 or epoch == 1:
+            print(f"  epoch {epoch:5d} | pde {lp.item():.3e} | bc {lb.item():.3e}"
+                  f" | {time.time() - t0:6.1f}s")
+
+    print(f"   t       max|u| PINN   max|u| ref   ratio   rel L2")
+    rows = []
+    for t in TIMES:
+        ref = snaps[float(t)]
+        pin = eval_grid(model, float(t), xs)
+        a, b = np.abs(pin).max(), np.abs(ref).max()
+        rel = np.linalg.norm(pin - ref) / np.linalg.norm(ref)
+        rows.append((t, a, b, a / b, rel))
+        print(f"   {t:.3f}    {a:8.4f}     {b:8.4f}   {a / b:6.3f}   {rel:6.3f}")
+    return tag, np.array(rows)
+
+
+if __name__ == "__main__":
+    print(f"building reference (sigma^2 = {SIGMA_SQ}, sigma = {1/np.sqrt(2*SIGMA_SQ):.4f})")
+    xs, snaps = reference(TIMES)
+    print(f"reference grid {len(xs)} points, h = {xs[1]-xs[0]:.4f}, "
+          f"{1/np.sqrt(2*SIGMA_SQ)/(xs[1]-xs[0]):.1f} points per sigma")
+
+    results = [run(f, xs, snaps) for f in (False, True)]
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+    ref_amp = results[0][1][:, 2]
+    ax[0].plot(TIMES, ref_amp, "k-", lw=2, label="free-space reference")
+    for tag, r in results:
+        ax[0].plot(r[:, 0], r[:, 1], "o--", label=f"PINN, {tag}")
+        ax[1].plot(r[:, 0], r[:, 4], "o-", label=tag)
+    ax[0].axvline(0.5, color="0.7", ls=":")
+    ax[0].set_xlabel("t"); ax[0].set_ylabel("max|u|"); ax[0].legend()
+    ax[0].set_title("amplitude tracking (dotted line: wave reaches the faces)")
+    ax[1].axhline(0.1, color="0.7", ls=":")
+    ax[1].set_xlabel("t"); ax[1].set_ylabel("relative L2"); ax[1].legend()
+    ax[1].set_title("relative L2 vs free space")
+    fig.tight_layout(); fig.savefig("n1_interior_test.png", dpi=130)
+
+    print("\nverdict (amplitude ratio at t = 0.5, want ~1.0):")
+    for tag, r in results:
+        i = int(np.argmin(np.abs(r[:, 0] - 0.5)))
+        print(f"  {tag:8s} ratio {r[i, 3]:.3f}   rel L2 {r[i, 4]:.3f}")
